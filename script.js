@@ -25,7 +25,23 @@ const STATE = { siswa:[], absensi:[], pelanggaran:[], konseling:[], kolaborasi:[
    situs ini (lihat PANDUAN-UPDATE.md), supaya guru mapel tidak perlu tahu atau
    menempel URL Apps Script sama sekali. Kalau dikosongkan, layar Admin BK tetap
    bisa mengisi URL secara manual seperti sebelumnya (mode lama tidak rusak). */
-const DEFAULT_API_URL = 'https://script.google.com/macros/s/AKfycby2jRRMF2fMWk7A2gQh50K519XnES9yVOArEl5peCgzGhF1Kwkfr33HdiPiMGUTmxwLOg/exec';
+const DEFAULT_API_URL = 'https://script.google.com/macros/s/AKfycbxPfupYwnS9Y6Be6-tflY4PNHt5HWGtj8rzLbQiGOqJ81hkn2JDELQ9q4rWjtcgiYbb/exec';
+
+/* URL Web App yang pernah tersimpan di browser (localStorage) dulu SELALU menang atas
+   DEFAULT_API_URL, jadi setelah URL di file ini diganti, browser yang sudah pernah login
+   tetap memanggil server LAMA (akibatnya login gagal walau kode sudah diperbarui).
+   Sekarang URL & sesi lama dibuang otomatis kalau DEFAULT_API_URL berubah dari yang
+   terakhir dipakai browser ini. Pengguna cukup login ulang satu kali. */
+(function reconcileApiUrl(){
+  if (!DEFAULT_API_URL) return;
+  try{
+    if (localStorage.getItem('bk_api_url_snapshot') !== DEFAULT_API_URL){
+      ['bk_api_url','bk_api_token','bk_role','bk_guru_nama','bk_guru_kelas','bk_konselor_nama','bk_konselor_kelas']
+        .forEach(k => localStorage.removeItem(k));
+      localStorage.setItem('bk_api_url_snapshot', DEFAULT_API_URL);
+    }
+  }catch(e){}
+})();
 
 let API_URL = localStorage.getItem('bk_api_url') || DEFAULT_API_URL;
 let API_TOKEN = localStorage.getItem('bk_api_token') || '';
@@ -75,6 +91,16 @@ function renderSchoolProfile(){
 }
 
 /* ---------------- ADAPTER: real Apps Script vs offline demo ---------------- */
+/* Backend versi lama menolak aksi login dengan pesan "Token akses salah atau kosong".
+   Pesan itu tidak ada di Code.gs terbaru, jadi kalau muncul berarti server yang
+   dipanggil belum memakai Code.gs terbaru / belum di-deploy ulang. */
+function explainLoginError(msg){
+  if (/token akses salah|periksa pengaturan koneksi/i.test(String(msg || ''))){
+    return 'Server (Google Apps Script) masih memakai kode lama. Admin: tempel Code.gs terbaru, lalu Deploy > Manage deployments > New version.';
+  }
+  return msg || 'Gagal login';
+}
+
 const RealAdapter = {
   /* Login Guru Mapel: hanya kirim username & password (tidak pernah URL/token
      master), backend membalas sessionToken terbatas yang lalu dipakai sebagai
@@ -82,7 +108,7 @@ const RealAdapter = {
   async loginGuru(username, password){
     const res = await fetch(API_URL, { method:'POST', body: JSON.stringify({ action:'loginGuru', username, password }) });
     const json = await res.json();
-    if (!json.ok) throw new Error(json.error || 'Gagal login');
+    if (!json.ok) throw new Error(explainLoginError(json.error));
     return json.data;
   },
   /* Login Konselor (Guru BK per-kelas): sama alurnya dengan loginGuru, hanya
@@ -90,7 +116,7 @@ const RealAdapter = {
   async loginKonselor(username, password){
     const res = await fetch(API_URL, { method:'POST', body: JSON.stringify({ action:'loginKonselor', username, password }) });
     const json = await res.json();
-    if (!json.ok) throw new Error(json.error || 'Gagal login');
+    if (!json.ok) throw new Error(explainLoginError(json.error));
     return json.data;
   },
   async getAll(type){
@@ -171,6 +197,13 @@ const RealAdapter = {
     const res = await fetch(API_URL, { method:'POST', body: JSON.stringify({ action:'lulusSiswa', ids, tahunLulus, token: API_TOKEN }) });
     const json = await res.json();
     if (!json.ok) throw new Error(json.error || 'Gagal melakukan kelulusan siswa');
+    return json.data;
+  },
+  /* Hapus massal Data Siswa: banyak siswa terpilih dihapus dalam SATU permintaan. */
+  async deleteSiswaBulk(ids){
+    const res = await fetch(API_URL, { method:'POST', body: JSON.stringify({ action:'deleteBulk', type:'siswa', ids, token: API_TOKEN }) });
+    const json = await res.json();
+    if (!json.ok) throw new Error(json.error || 'Gagal menghapus data siswa terpilih');
     return json.data;
   }
 };
@@ -277,6 +310,14 @@ const DemoAdapter = {
     this.write('siswa', after);
     this.write('siswaLulus', arsip);
     return { deleted: before.length - after.length, archived: before.length - after.length };
+  },
+  /* Padanan deleteSiswaBulk di RealAdapter, murni di localStorage untuk mode demo. */
+  async deleteSiswaBulk(ids){
+    const idSet = new Set((ids||[]).map(String));
+    const before = this.read('siswa');
+    const after = before.filter(s => !idSet.has(String(s.ID)));
+    this.write('siswa', after);
+    return { deleted: before.length - after.length };
   },
   seedIfEmpty(){
     if (this.read('siswa').length) return;
@@ -412,6 +453,7 @@ async function loadAll(){
     STATE.konselor = data.konselor || [];
     STATE.siswaLulus = data.siswaLulus || [];
     applySettingsFromServer(data.pengaturan || {});
+    applyProfileFromServer(data._me);
     populateClassFilters();
     renderCurrentPage();
     renderDashboard();
@@ -887,11 +929,20 @@ document.addEventListener('click', e => {
 });
 
 /* ---------------- KOMBOBOX PENCARIAN SISWA (dipakai di semua form: absensi, pelanggaran, dst) ---------------- */
+/* Daftar kelas yang boleh dipilih saat MENCATAT data lewat form. Konselor dengan kelas
+   tanggung jawab hanya melihat kelasnya sendiri (server tetap menolak kelas lain). */
+function writableKelasList(){
+  const all = uniqueClasses();
+  if (USER_ROLE !== 'konselor' || !KONSELOR_KELAS.length) return all;
+  const own = KONSELOR_KELAS.map(k => String(k).trim().toLowerCase());
+  return all.filter(c => own.includes(String(c).trim().toLowerCase()));
+}
 function siswaPickerFilter(wrap, query){
   const q = (query||'').trim().toLowerCase();
   const kelasSel = wrap.querySelector('.siswa-picker-kelas');
   const kelas = kelasSel ? kelasSel.value : '';
-  let list = STATE.siswa;
+  const allowed = writableKelasList();
+  let list = STATE.siswa.filter(s => allowed.includes(s.Kelas));
   if (kelas) list = list.filter(s => s.Kelas === kelas);
   return list.filter(s => !q ||
     (s.Nama||'').toLowerCase().includes(q) ||
@@ -911,6 +962,7 @@ function siswaPickerRenderDropdown(wrap, query){
   dd.classList.add('open');
 }
 document.addEventListener('input', e => {
+  if (e.target.name === 'NamaOrtuWali') e.target.dataset.auto = '0'; // diketik manual -> jangan ditimpa otomatis
   if (!e.target.classList.contains('siswa-picker-input')) return;
   const wrap = e.target.closest('.siswa-picker');
   wrap.querySelector('input[type=hidden]').value = '';
@@ -939,6 +991,12 @@ document.addEventListener('click', e => {
     wrap.querySelector('input[type=hidden]').value = s.ID;
     wrap.querySelector('.siswa-picker-input').value = `${s.Nama} — ${s.Kelas||'-'}`;
     wrap.querySelector('.siswa-picker-dropdown').classList.remove('open');
+    // Form Kolaborasi: isi otomatis Nama Orang Tua/Wali dari data siswa (hanya kalau masih kosong)
+    const ortuInput = wrap.closest('form') && wrap.closest('form').querySelector('input[name="NamaOrtuWali"]');
+    if (ortuInput && (!ortuInput.value.trim() || ortuInput.dataset.auto === '1')){
+      ortuInput.value = s.NamaOrtu || '';
+      ortuInput.dataset.auto = '1'; // terisi otomatis: boleh diganti lagi kalau pilih siswa lain
+    }
     return;
   }
   $all('.siswa-picker-dropdown.open').forEach(dd => {
@@ -1029,22 +1087,51 @@ function renderActivityList(){
 }
 
 /* ---------------- DATA SISWA ---------------- */
-function renderSiswa(searchQuery){
+/* ID siswa yang dicentang untuk Hapus Massal. Disimpan di luar renderSiswa()
+   supaya centang tidak hilang tiap kali tabel digambar ulang (mis. saat mengetik
+   di kolom pencarian). */
+const SISWA_SELECTED = new Set();
+
+function renderSiswa(){
+  // Kata kunci selalu dibaca langsung dari kotak pencarian, jadi konsisten walau
+  // renderSiswa() dipanggil dari centang/filter kelas/hapus (bukan hanya dari pencarian).
+  const q = (($('#globalSearch') && $('#globalSearch').value) || '').trim().toLowerCase();
   const kelas = $('#filterKelasSiswa').value;
+  const canBulk = USER_ROLE === 'admin'; // hapus massal hanya untuk Admin (ditegakkan juga di server)
   let rows = STATE.siswa.filter(s => !kelas || s.Kelas === kelas);
-  if (searchQuery) rows = rows.filter(s =>
-    (s.Nama||'').toLowerCase().includes(searchQuery) ||
-    (s.NIS||'').toString().toLowerCase().includes(searchQuery) ||
-    (s.NamaOrtu||'').toLowerCase().includes(searchQuery)
+  if (q) rows = rows.filter(s =>
+    (s.Nama||'').toLowerCase().includes(q) ||
+    (s.NIS||'').toString().toLowerCase().includes(q) ||
+    (s.NamaOrtu||'').toLowerCase().includes(q)
   );
+  // Urut abjad (A-Z) berdasarkan Nama; kalau namanya sama, urut lanjut berdasarkan Kelas.
+  rows = rows.slice().sort((a,b) =>
+    String(a.Nama||'').localeCompare(String(b.Nama||''), 'id', { sensitivity:'base' }) ||
+    String(a.Kelas||'').localeCompare(String(b.Kelas||''), 'id', { numeric:true })
+  );
+
+  // Buang centang untuk siswa yang sudah tidak ada (mis. baru dihapus).
+  const existingIds = new Set(STATE.siswa.map(s => String(s.ID)));
+  Array.from(SISWA_SELECTED).forEach(id => { if (!existingIds.has(id)) SISWA_SELECTED.delete(id); });
+  if (!canBulk) SISWA_SELECTED.clear();
+
+  $('#siswaCheckAllTh').classList.toggle('hidden', !canBulk);
   const tbody = $('#tableSiswa tbody');
   const emptyState = $('#page-siswa .empty-state');
-  if (!rows.length){ tbody.innerHTML=''; emptyState.style.display='block'; return; }
-  emptyState.style.display='none';
+  if (!rows.length){
+    tbody.innerHTML = '';
+    emptyState.style.display = 'block';
+    updateSiswaFooter(rows, kelas, q);
+    updateSiswaBulkUI(rows);
+    return;
+  }
+  emptyState.style.display = 'none';
   tbody.innerHTML = rows.map(s => {
     const pelanggaranCount = STATE.pelanggaran.filter(p => String(p.SiswaID)===String(s.ID)).length;
     const status = pelanggaranCount >= 3 ? { txt:'Perlu Perhatian', cls:'danger' } : pelanggaranCount >= 1 ? { txt:'Pemantauan', cls:'amber' } : { txt:'Baik', cls:'success' };
-    return `<tr>
+    const checked = SISWA_SELECTED.has(String(s.ID));
+    return `<tr${checked ? ' class="row-selected"' : ''}>
+      ${canBulk ? `<td class="col-check"><input type="checkbox" class="siswa-check" data-id="${escapeHtml(s.ID)}" ${checked ? 'checked' : ''} aria-label="Pilih ${escapeHtml(s.Nama||'siswa')}" /></td>` : ''}
       <td>${escapeHtml(s.NIS||'-')}</td>
       <td><div style="display:flex;align-items:center;gap:10px">
             <span class="avatar-ring" style="width:30px;height:30px;font-size:11px;background:${colorFromString(s.Nama)}">${escapeHtml(initials(s.Nama))}</span>
@@ -1061,7 +1148,78 @@ function renderSiswa(searchQuery){
           </div></td>
     </tr>`;
   }).join('');
+  updateSiswaFooter(rows, kelas, q);
+  updateSiswaBulkUI(rows);
 }
+
+/* Keterangan jumlah siswa di paling bawah tabel Data Siswa. */
+function updateSiswaFooter(rows, kelas, q){
+  const el = $('#siswaCountFooter');
+  if (!el) return;
+  const total = STATE.siswa.length;
+  const putra = rows.filter(isPutra).length;
+  const putri = rows.filter(isPutri).length;
+  const filtered = !!(kelas || q);
+  let txt = filtered
+    ? `Menampilkan <b>${rows.length}</b> dari <b>${total}</b> siswa`
+    : `Total <b>${total}</b> siswa`;
+  if (kelas) txt += ` · Kelas <b>${escapeHtml(kelas)}</b>`;
+  txt += ` &nbsp;|&nbsp; Laki-laki: <b>${putra}</b> · Perempuan: <b>${putri}</b>`;
+  el.innerHTML = txt;
+}
+
+/* Sinkronkan tombol "Hapus Terpilih" & kotak centang "pilih semua" dengan
+   siswa yang sedang tampil (sesuai filter kelas/pencarian). */
+function updateSiswaBulkUI(visibleRows){
+  const btn = $('#btnBulkDeleteSiswa');
+  const checkAll = $('#siswaCheckAll');
+  const n = SISWA_SELECTED.size;
+  if (btn){
+    btn.classList.toggle('hidden', USER_ROLE !== 'admin' || n === 0);
+    $('#bulkDeleteSiswaCount').textContent = n;
+  }
+  if (checkAll){
+    const visibleIds = visibleRows.map(s => String(s.ID));
+    const selectedVisible = visibleIds.filter(id => SISWA_SELECTED.has(id)).length;
+    checkAll.checked = visibleIds.length > 0 && selectedVisible === visibleIds.length;
+    checkAll.indeterminate = selectedVisible > 0 && selectedVisible < visibleIds.length;
+  }
+}
+
+document.addEventListener('change', (e) => {
+  const t = e.target;
+  if (t.matches && t.matches('.siswa-check')){
+    const id = String(t.dataset.id);
+    if (t.checked) SISWA_SELECTED.add(id); else SISWA_SELECTED.delete(id);
+    t.closest('tr')?.classList.toggle('row-selected', t.checked);
+    renderSiswa(); // segarkan tombol/pilih-semua (centang tetap karena disimpan di SISWA_SELECTED)
+  } else if (t.id === 'siswaCheckAll'){
+    $all('#tableSiswa .siswa-check').forEach(cb => {
+      if (t.checked) SISWA_SELECTED.add(String(cb.dataset.id)); else SISWA_SELECTED.delete(String(cb.dataset.id));
+    });
+    renderSiswa();
+  }
+});
+
+$('#btnBulkDeleteSiswa')?.addEventListener('click', async () => {
+  if (USER_ROLE !== 'admin'){ toast('Hanya Admin/Guru BK utama yang bisa menghapus data massal.', 'error'); return; }
+  const ids = Array.from(SISWA_SELECTED);
+  if (!ids.length) return;
+  if (!confirm(`Yakin ingin menghapus ${ids.length} siswa terpilih dari Data Siswa?\n\nTindakan ini tidak dapat dibatalkan. (Kalau siswa ini sudah lulus, gunakan menu Kenaikan & Kelulusan supaya masuk arsip alumni.)`)) return;
+  showLoading(true);
+  try{
+    const result = await adapter.deleteSiswaBulk(ids);
+    const idSet = new Set(ids);
+    STATE.siswa = STATE.siswa.filter(s => !idSet.has(String(s.ID)));
+    SISWA_SELECTED.clear();
+    renderCurrentPage(); renderDashboard(); populateClassFilters();
+    toast(`${(result && result.deleted != null) ? result.deleted : ids.length} siswa berhasil dihapus.`, 'success');
+  }catch(err){
+    toast('Gagal menghapus siswa terpilih: ' + err.message, 'error');
+  }finally{
+    showLoading(false);
+  }
+});
 $('#filterKelasSiswa').addEventListener('change', () => renderSiswa());
 
 /* ---------------- ABSENSI ---------------- */
@@ -1175,7 +1333,8 @@ function renderKolaborasi(searchQuery){
       </div>
       <div class="entry-body">
         <p><span class="badge badge--info">${escapeHtml(k.Jenis||'-')}</span></p>
-        <p style="margin-top:8px"><b>Tujuan:</b> ${escapeHtml(k.Tujuan||'-')}</p>
+        <p style="margin-top:8px"><b>Orang Tua/Wali:</b> ${escapeHtml(k.NamaOrtuWali||'-')}</p>
+        <p><b>Tujuan:</b> ${escapeHtml(k.Tujuan||'-')}</p>
         <p><b>Hasil:</b> ${escapeHtml(k.Hasil||'-')}</p>
         ${k.BuktiFoto ? `<p style="margin-top:8px"><b>Bukti Home Visit:</b><br/><img src="${escapeHtml(k.BuktiFoto)}" alt="Bukti Home Visit" class="bukti-foto-thumb" data-lightbox-id="${escapeHtml(k.ID)}" title="Klik untuk perbesar" /></p>` : ''}
       </div>
@@ -1325,6 +1484,7 @@ const FORM_CONFIG = {
       { key:'Tanggal', label:'Tanggal', type:'date', required:true, default: () => new Date().toISOString().slice(0,10) },
       { key:'SiswaID', label:'Siswa', type:'select-siswa', required:true, full:true },
       { key:'Jenis', label:'Jenis Kegiatan', type:'select', options:['Pemanggilan Orang Tua','Home Visit'], required:true },
+      { key:'NamaOrtuWali', label:'Nama Orang Tua / Wali', type:'text', placeholder:'Terisi otomatis dari data siswa, bisa diubah (mis. wali)' },
       { key:'Petugas', label:'Petugas BK', type:'text', default: () => (USER_ROLE === 'konselor' ? KONSELOR_NAMA : '') },
       { key:'Tujuan', label:'Tujuan Kegiatan', type:'textarea', full:true },
       { key:'Hasil', label:'Hasil / Kesepakatan', type:'textarea', full:true },
@@ -1409,7 +1569,7 @@ function openForm(type, id, prefill){
     if (f.type === 'select-siswa'){
       const selSiswa = val ? siswaById(val) : null;
       const displayVal = selSiswa ? `${selSiswa.Nama} — ${selSiswa.Kelas||'-'}` : '';
-      const kelasOpts = uniqueClasses().map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+      const kelasOpts = writableKelasList().map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
       return `<div class="${wrapClass}"><label>${f.label}</label>
         <div class="siswa-picker">
           <div class="siswa-picker-row">
@@ -1492,10 +1652,19 @@ function closeModal(){ $('#modalBackdrop').classList.remove('open'); }
    kelas masuk semua), pilih satu status, lalu simpan sekaligus. Tidak mengubah
    tampilan/alur "Catat Absensi" satu-per-satu yang sudah ada — ini murni tombol
    tambahan di sebelahnya. */
+function bulkAbsensiAllowedKelas(){
+  const all = uniqueClasses();
+  if (USER_ROLE !== 'konselor' || !KONSELOR_KELAS.length) return all;
+  const own = KONSELOR_KELAS.map(k => String(k).trim().toLowerCase());
+  return all.filter(c => own.includes(String(c).trim().toLowerCase()));
+}
 function openBulkAbsensi(){
   $('#modalTitle').textContent = 'Absen Massal per Kelas';
   const today = new Date().toISOString().slice(0,10);
-  const kelasOpts = uniqueClasses().map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+  // Konselor hanya boleh absen massal di kelas tanggung jawabnya (kosong = semua kelas).
+  // Server juga menegakkan ini, jadi ini hanya merapikan pilihan di tampilan.
+  const allowedKelas = bulkAbsensiAllowedKelas();
+  const kelasOpts = allowedKelas.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
 
   $('#modalBody').innerHTML = `
     <form id="bulkAbsensiForm">
@@ -1569,6 +1738,7 @@ function openBulkAbsensi(){
     const status = $('#bulkStatus').value;
     const keterangan = $('#bulkKeterangan').value || '';
     if (!tanggal || !kelas || !status){ toast('Tanggal, kelas, dan status wajib diisi.', 'error'); return; }
+    if (!bulkAbsensiAllowedKelas().includes(kelas)){ toast('Anda hanya bisa absen massal untuk kelas tanggung jawab Anda.', 'error'); return; }
     const checkedIds = $all('.bulk-siswa-check:checked').map(cb => cb.value);
     if (!checkedIds.length){ toast('Centang minimal satu siswa.', 'error'); return; }
 
@@ -1753,9 +1923,9 @@ const REPORT_COLUMNS = {
   absensi: ['Tanggal','Nama','Kelas','Status','Keterangan'],
   pelanggaran: ['Tanggal','Nama','Kelas','JenisPelanggaran','Poin','Penanganan'],
   konseling: ['Tanggal','Nama','Kelas','Topik','HasilKonseling','TindakLanjut','TTD'],
-  kolaborasi: ['Tanggal','Nama','Kelas','Jenis','Tujuan','Hasil'],
-  pemanggilan_ortu: ['Tanggal','Nama','Kelas','Tujuan','Hasil','Petugas'],
-  home_visit: ['Tanggal','Nama','Kelas','Tujuan','Hasil','Petugas'],
+  kolaborasi: ['Tanggal','Nama','Kelas','Jenis','NamaOrtuWali','Tujuan','Hasil'],
+  pemanggilan_ortu: ['Tanggal','Nama','Kelas','NamaOrtuWali','Tujuan','Hasil','Petugas'],
+  home_visit: ['Tanggal','Nama','Kelas','NamaOrtuWali','Tujuan','Hasil','Petugas'],
   siswa_lulus: ['NIS','Nama','Kelas','JenisKelamin','NamaOrtu','NoHPOrtu','TahunLulus','TanggalLulus']
 };
 const REPORT_TITLES = {
@@ -1947,7 +2117,7 @@ $('#btnGenerateReport').addEventListener('click', () => {
       ${buildReportSummaryHtml('pelanggaran', pelanggaran)}
       ${section('Rekap Pelanggaran', ['Tanggal','JenisPelanggaran','Poin','Penanganan'], pelanggaran, 'Tidak ada catatan pelanggaran')}
       ${section('Rekap Konseling', ['Tanggal','Topik','HasilKonseling','TindakLanjut','TTD'], konseling, 'Tidak ada catatan konseling')}
-      ${section('Rekap Pemanggilan Orang Tua', ['Tanggal','Tujuan','Hasil','Petugas'], kolaborasi.filter(r => r.Jenis === 'Pemanggilan Orang Tua'), 'Tidak ada catatan pemanggilan orang tua')}
+      ${section('Rekap Pemanggilan Orang Tua', ['Tanggal','NamaOrtuWali','Tujuan','Hasil','Petugas'], kolaborasi.filter(r => r.Jenis === 'Pemanggilan Orang Tua'), 'Tidak ada catatan pemanggilan orang tua')}
       <h3 style="margin-top:22px">Rekap Home Visit</h3>
       ${buildHomeVisitReportHtml(kolaborasi.filter(r => r.Jenis === 'Home Visit'))}
       ${s.Catatan ? `<h3 style="margin-top:22px">Catatan Tambahan</h3><p>${escapeHtml(s.Catatan)}</p>` : ''}
@@ -2478,6 +2648,7 @@ function buildHomeVisitReportHtml(rows){
         <b>${escapeHtml(r.Nama||'-')}</b>&nbsp;<span class="muted">(${escapeHtml(r.Kelas||'-')})</span>
         <span class="report-homevisit-date">${fmtDate(r.Tanggal)}</span>
       </div>
+      <p><b>Orang Tua/Wali:</b> ${escapeHtml(r.NamaOrtuWali||'-')}</p>
       <p><b>Tujuan:</b> ${escapeHtml(r.Tujuan||'-')}</p>
       <p><b>Hasil:</b> ${escapeHtml(r.Hasil||'-')}</p>
       <p><b>Petugas:</b> ${escapeHtml(r.Petugas||'-')}</p>
@@ -2492,11 +2663,31 @@ function buildHomeVisitReportHtml(rows){
    manual lewat tombol "Tambah Siswa" tetap berfungsi seperti biasa. */
 const SISWA_TEMPLATE_COLUMNS = ['NIS','Nama','Kelas','JenisKelamin','TempatTglLahir','NamaOrtu','NoHPOrtu','Alamat','Catatan'];
 
+/* Nomor HP Indonesia selalu berawalan 0 (atau 62). Kalau Excel sudah telanjur
+   membuang nol-nya (mis. "81234567890"), kembalikan nolnya. Spasi/strip dibuang. */
+function normalizeNoHP(v){
+  let s = String(v || '').trim().replace(/[\s\-().]/g, '');
+  if (!s) return '';
+  if (/^\d+$/.test(s) && s.charAt(0) === '8' && s.length >= 9 && s.length <= 12) s = '0' + s;
+  return s;
+}
+
 function downloadSiswaTemplate(){
   const contoh = { NIS:'2201099', Nama:'Contoh Nama Siswa', Kelas:'VII-A', JenisKelamin:'L',
     TempatTglLahir:'Kota, 01-01-2012', NamaOrtu:'Nama Orang Tua', NoHPOrtu:'0812xxxxxxx',
     Alamat:'Alamat lengkap', Catatan:'' };
   const ws = XLSX.utils.json_to_sheet([contoh], { header: SISWA_TEMPLATE_COLUMNS });
+  // Format kolom NIS & NoHPOrtu = TEKS (sampai baris 1000) supaya Excel tidak membuang nol di depan
+  // saat guru mengetik/menempel data di template ini.
+  ['NIS','NoHPOrtu'].forEach(col => {
+    const c = SISWA_TEMPLATE_COLUMNS.indexOf(col);
+    for (let r = 1; r <= 1000; r++){
+      const addr = XLSX.utils.encode_cell({ r, c });
+      const cell = ws[addr] || (ws[addr] = { t:'s', v:'' });
+      cell.t = 's'; cell.z = '@'; cell.v = String(cell.v == null ? '' : cell.v);
+    }
+  });
+  ws['!ref'] = XLSX.utils.encode_range({ s:{ r:0, c:0 }, e:{ r:1000, c:SISWA_TEMPLATE_COLUMNS.length - 1 } });
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Siswa');
   XLSX.writeFile(wb, 'Template_Import_Siswa_BKDigital.xlsx');
@@ -2510,13 +2701,16 @@ $('#importSiswaFile').addEventListener('change', async (e) => {
   showLoading(true);
   try{
     const buf = await file.arrayBuffer();
-    const wb = XLSX.read(buf, { type:'array' });
+    // cellText:true + raw:false -> yang dibaca adalah TEKS persis seperti tampil di Excel,
+    // bukan angka mentah. Ini yang menjaga nol di depan (mis. NIS "0012345678").
+    const wb = XLSX.read(buf, { type:'array', cellText:true, cellDates:false });
     const ws = wb.Sheets[wb.SheetNames[0]];
-    const rows = XLSX.utils.sheet_to_json(ws, { defval:'' });
+    const rows = XLSX.utils.sheet_to_json(ws, { defval:'', raw:false });
     const cleaned = rows
       .map(r => {
         const o = {};
         SISWA_TEMPLATE_COLUMNS.forEach(c => { o[c] = (r[c] !== undefined ? String(r[c]).trim() : ''); });
+        o.NoHPOrtu = normalizeNoHP(o.NoHPOrtu);
         return o;
       })
       .filter(r => r.NIS && r.Nama); // baris tanpa NIS/Nama diabaikan
@@ -2683,6 +2877,31 @@ $('#konselorPasswordInput').addEventListener('keydown', (e) => { if (e.key === '
      bukan di penyembunyian menu.
    Ini murni tampilan — backend TETAP menolak akses ke tipe/kelas data yang
    tidak diizinkan walau menu terlihat (lihat Code.gs). */
+function updateRoleBadge(){
+  const badge = $('#guruBadge');
+  if (!badge) return;
+  badge.classList.toggle('hidden', false);
+  if (USER_ROLE === 'guru') badge.textContent = `${GURU_NAMA}${GURU_KELAS.length ? ' · ' + GURU_KELAS.join(', ') : ' · Semua Kelas'}`;
+  else if (USER_ROLE === 'konselor') badge.textContent = `${KONSELOR_NAMA}${KONSELOR_KELAS.length ? ' · Konseling: ' + KONSELOR_KELAS.join(', ') : ' · Konseling: Semua Kelas'}`;
+  else badge.textContent = 'Admin BK';
+}
+/* Profil akun (nama & kelas) yang dikirim server tiap kali data dimuat. Kelas di
+   token login/localStorage bisa basi kalau Admin mengubahnya setelah login, jadi
+   selalu ditimpa dengan data terbaru dari Sheet. */
+function applyProfileFromServer(me){
+  if (!me || USER_ROLE === 'admin') return;
+  const kelas = Array.isArray(me.kelas) ? me.kelas : [];
+  if (USER_ROLE === 'konselor'){
+    KONSELOR_NAMA = me.nama || KONSELOR_NAMA; KONSELOR_KELAS = kelas;
+    localStorage.setItem('bk_konselor_nama', KONSELOR_NAMA);
+    localStorage.setItem('bk_konselor_kelas', JSON.stringify(KONSELOR_KELAS));
+  } else if (USER_ROLE === 'guru'){
+    GURU_NAMA = me.nama || GURU_NAMA; GURU_KELAS = kelas;
+    localStorage.setItem('bk_guru_nama', GURU_NAMA);
+    localStorage.setItem('bk_guru_kelas', JSON.stringify(GURU_KELAS));
+  }
+  updateRoleBadge();
+}
 function applyRoleUI(){
   const isGuru = USER_ROLE === 'guru';
   const isKonselor = USER_ROLE === 'konselor';
@@ -2708,7 +2927,7 @@ function applyRoleUI(){
      hanya untuk tipe yang memang masih tertutup total buat Konselor (Data Siswa)
      dan fitur admin-only (Absen Massal, Import Siswa) yang tetap
      ditolak server siapa pun selain Admin. */
-  ['#btnAddSiswa','#btnImportSiswa','#btnBulkAbsensi']
+  ['#btnAddSiswa','#btnImportSiswa']
     .forEach(sel => { const el = $(sel); if (el) el.classList.toggle('hidden', isKonselor); });
   /* Menu "Kenaikan & Kelulusan" mengelola Data Siswa secara massal (termasuk
      menghapus siswa saat kelulusan) — backend hanya mengizinkan Admin/Guru BK
@@ -2716,13 +2935,7 @@ function applyRoleUI(){
      Konselor di tampilan (bukan cuma Guru Mapel yang sudah tertutup lewat
      aturan umum di atas). */
   $all('.nav-item[data-page="kenaikan"]').forEach(n => n.classList.toggle('hidden', isGuru || isKonselor));
-  const badge = $('#guruBadge');
-  if (badge){
-    badge.classList.toggle('hidden', false);
-    if (isGuru) badge.textContent = `${GURU_NAMA}${GURU_KELAS.length ? ' · ' + GURU_KELAS.join(', ') : ' · Semua Kelas'}`;
-    else if (isKonselor) badge.textContent = `${KONSELOR_NAMA}${KONSELOR_KELAS.length ? ' · Konseling: ' + KONSELOR_KELAS.join(', ') : ' · Konseling: Semua Kelas'}`;
-    else badge.textContent = 'Admin BK';
-  }
+  updateRoleBadge();
   if (isGuru) goToPage('pelanggaran');
   else if (isKonselor) goToPage('konseling');
 }
@@ -2994,9 +3207,103 @@ $('#guruAccountsBtnMobile').addEventListener('click', () => { closeMoreSheet(); 
 $('#konselorAccountsBtn').addEventListener('click', () => openKonselorAccounts());
 $('#konselorAccountsBtnMobile').addEventListener('click', () => { closeMoreSheet(); openKonselorAccounts(); });
 
+/* ---------------- PEMILIH KELAS TANGGUNG JAWAB (multi-pilih) ----------------
+   Dipakai di Kelola Akun Guru Mapel & Guru BK. Admin tinggal centang kelas
+   (boleh lebih dari satu) tanpa mengetik. Daftar kelas diambil otomatis dari
+   Data Siswa. "Semua Kelas" dicentang = tidak ada pembatasan (kolom Kelas
+   dikosongkan, sama seperti aturan di server). Format simpan tetap sama:
+   "VII-A, VII-B" (dipisah koma), jadi data lama & Code.gs tidak perlu diubah. */
+function kelasPickerHtml(id){
+  return `
+    <div class="kelas-picker" id="${id}">
+      <div class="kp-toolbar">
+        <label class="checkbox-pill kp-all"><input type="checkbox" data-kp-all checked /> Semua Kelas</label>
+        <span class="muted kp-summary"></span>
+      </div>
+      <div class="checkbox-group kp-list"></div>
+      <div class="kp-add">
+        <input type="text" class="kp-add-input" placeholder="Kelas belum ada siswanya? Ketik nama kelas lalu Tambah" />
+        <button type="button" class="btn btn-ghost kp-add-btn"><i class="fa-solid fa-plus"></i> Tambah</button>
+      </div>
+    </div>`;
+}
+function parseKelasString(str){
+  return String(str || '').split(',').map(k => k.trim()).filter(Boolean);
+}
+function kelasPickerInit(id){
+  const root = document.getElementById(id);
+  const allBox = root.querySelector('[data-kp-all]');
+  const listEl = root.querySelector('.kp-list');
+  const summary = root.querySelector('.kp-summary');
+  const addInput = root.querySelector('.kp-add-input');
+  const natural = (a,b) => String(a).localeCompare(String(b), 'id', { numeric:true });
+
+  function boxes(){ return Array.from(listEl.querySelectorAll('input[type=checkbox]')); }
+  function updateSummary(){
+    const n = boxes().filter(b => b.checked).length;
+    summary.textContent = n ? `${n} kelas dipilih` : 'Tidak dibatasi (akses semua kelas)';
+  }
+  function addPill(kelas, checked){
+    const exists = boxes().find(b => b.value.toLowerCase() === kelas.toLowerCase());
+    if (exists){ if (checked) exists.checked = true; return; }
+    const label = document.createElement('label');
+    label.className = 'checkbox-pill';
+    label.innerHTML = `<input type="checkbox" value="${escapeHtml(kelas)}" /> ${escapeHtml(kelas)}`;
+    label.querySelector('input').checked = !!checked;
+    // sisipkan sesuai urutan alfabet-angka
+    const sorted = boxes().find(b => natural(b.value, kelas) > 0);
+    if (sorted) listEl.insertBefore(label, sorted.closest('label')); else listEl.appendChild(label);
+  }
+  function build(){
+    listEl.innerHTML = '';
+    const classes = uniqueClasses().slice().sort(natural);
+    if (!classes.length){
+      listEl.innerHTML = '<span class="muted">Belum ada data siswa, jadi belum ada daftar kelas. Ketik nama kelas di bawah lalu klik Tambah.</span>';
+    }
+    classes.forEach(c => addPill(c, false));
+  }
+  function syncAll(){
+    allBox.checked = boxes().every(b => !b.checked);
+    updateSummary();
+  }
+
+  allBox.addEventListener('change', () => {
+    if (allBox.checked) boxes().forEach(b => b.checked = false);
+    else if (!boxes().some(b => b.checked)) allBox.checked = true; // minimal salah satu mode aktif
+    updateSummary();
+  });
+  listEl.addEventListener('change', syncAll);
+  function addManual(){
+    const v = addInput.value.trim();
+    if (!v) return;
+    if (v.includes(',')){ toast('Tambahkan satu kelas per kali (tanpa koma).', 'error'); return; }
+    if (listEl.querySelector('.muted')) listEl.innerHTML = '';
+    addPill(v, true);
+    addInput.value = '';
+    syncAll();
+  }
+  root.querySelector('.kp-add-btn').addEventListener('click', addManual);
+  addInput.addEventListener('keydown', (e) => { if (e.key === 'Enter'){ e.preventDefault(); addManual(); } });
+
+  build();
+  updateSummary();
+
+  return {
+    get(){ return boxes().filter(b => b.checked).map(b => b.value).join(', '); },
+    set(str){
+      const wanted = parseKelasString(str);
+      boxes().forEach(b => { b.checked = false; });
+      // kelas tersimpan yang belum ada di daftar (mis. belum ada siswanya) tetap ditampilkan
+      wanted.forEach(k => addPill(k, true));
+      syncAll();
+    },
+    reset(){ this.set(''); addInput.value = ''; }
+  };
+}
+
 /* ---------------- KELOLA AKUN GURU MAPEL ----------------
    Admin/Guru BK menambah, mengedit, dan menghapus akun login guru mapel
-   dari sini. Kelas diketik dipisah koma (mis. "VII-A, VII-B") — itulah
+   dari sini. Kelas dipilih lewat centang (boleh lebih dari satu) — itulah
    satu-satunya kelas yang bisa dilihat/dicatat pelanggarannya oleh akun ini,
    ditegakkan di server (lihat Code.gs), bukan cuma disembunyikan di tampilan. */
 function openGuruAccounts(){
@@ -3004,7 +3311,7 @@ function openGuruAccounts(){
   let editingId = null;
 
   $('#modalBody').innerHTML = `
-    <p class="muted" style="margin:0 0 14px">Setiap akun di bawah bisa login (tanpa perlu tahu URL Web App/token) dan hanya melihat &amp; mencatat Pelanggaran untuk kelas yang kamu tulis di sini.</p>
+    <p class="muted" style="margin:0 0 14px">Setiap akun di bawah bisa login (tanpa perlu tahu URL Web App/token) dan hanya melihat &amp; mencatat Pelanggaran untuk kelas yang kamu pilih di sini.</p>
     <form id="guruAccountForm">
       <div class="form-grid">
         <div class="field"><label>Nama Guru</label>
@@ -3023,10 +3330,10 @@ function openGuruAccounts(){
           </select>
         </div>
         <div class="field full"><label>Kelas Tanggung Jawab</label>
-          <input type="text" id="gaKelas" placeholder="Contoh: VII-A, VII-B (pisahkan dengan koma) — kosongkan untuk akses ke SEMUA kelas" />
+          ${kelasPickerHtml('gaKelasPicker')}
         </div>
       </div>
-      <p class="muted" style="margin:-8px 0 14px">Kosongkan kolom Kelas kalau guru ini boleh mencatat pelanggaran untuk semua kelas, bukan hanya kelas tertentu.</p>
+      <p class="muted" style="margin:-8px 0 14px">Centang satu atau lebih kelas yang menjadi tanggung jawab guru ini. Biarkan &quot;Semua Kelas&quot; kalau guru ini boleh mencatat pelanggaran untuk semua kelas.</p>
       <div class="modal-actions" style="justify-content:flex-start; margin-bottom:18px">
         <button type="submit" class="btn btn-primary" id="gaSubmitBtn"><i class="fa-solid fa-plus"></i> Tambah Akun</button>
         <button type="button" class="btn btn-ghost hidden" id="gaCancelEditBtn">Batal Edit</button>
@@ -3063,6 +3370,7 @@ function openGuruAccounts(){
       </div>`).join('');
   }
   renderList();
+  const gaPicker = kelasPickerInit('gaKelasPicker');
 
   $('#gaList').addEventListener('click', async (e) => {
     const editBtn = e.target.closest('[data-ga-edit]');
@@ -3076,7 +3384,7 @@ function openGuruAccounts(){
       $('#gaPassword').value = '';
       $('#gaPassword').placeholder = 'Kosongkan jika tidak ingin mengubah password';
       $('#gaStatus').value = g.Status || 'Aktif';
-      $('#gaKelas').value = g.Kelas || '';
+      gaPicker.set(g.Kelas || '');
       $('#gaSubmitBtn').innerHTML = '<i class="fa-solid fa-check"></i> Update Akun';
       $('#gaCancelEditBtn').classList.remove('hidden');
       $('#gaNama').focus();
@@ -3098,7 +3406,7 @@ function openGuruAccounts(){
 
   $('#gaCancelEditBtn').addEventListener('click', () => {
     editingId = null;
-    $('#guruAccountForm').reset();
+    $('#guruAccountForm').reset(); gaPicker.reset();
     $('#gaPassword').placeholder = 'Isi/ganti password';
     $('#gaSubmitBtn').innerHTML = '<i class="fa-solid fa-plus"></i> Tambah Akun';
     $('#gaCancelEditBtn').classList.add('hidden');
@@ -3110,7 +3418,7 @@ function openGuruAccounts(){
     const username = $('#gaUsername').value.trim();
     const password = $('#gaPassword').value;
     const status = $('#gaStatus').value;
-    const kelas = $('#gaKelas').value.trim();
+    const kelas = gaPicker.get();
     if (!nama || !username){ toast('Nama dan Username wajib diisi.', 'error'); return; }
     if (!editingId && !password){ toast('Password wajib diisi untuk akun baru.', 'error'); return; }
     const btn = $('#gaSubmitBtn');
@@ -3130,7 +3438,7 @@ function openGuruAccounts(){
         toast('Akun guru mapel ditambahkan.', 'success');
       }
       editingId = null;
-      $('#guruAccountForm').reset();
+      $('#guruAccountForm').reset(); gaPicker.reset();
       $('#gaPassword').placeholder = 'Isi/ganti password';
       $('#gaSubmitBtn').innerHTML = '<i class="fa-solid fa-plus"></i> Tambah Akun';
       $('#gaCancelEditBtn').classList.add('hidden');
@@ -3209,7 +3517,7 @@ function openKonselorAccounts(){
   let editingId = null;
 
   $('#modalBody').innerHTML = `
-    <p class="muted" style="margin:0 0 14px">Setiap akun di bawah bisa login (tanpa perlu tahu URL Web App/token) dan hanya melihat &amp; mencatat <b>Konseling</b> untuk siswa di kelas yang kamu tulis di sini. Password bisa diisi PIN pendek supaya mudah diingat.</p>
+    <p class="muted" style="margin:0 0 14px">Setiap akun di bawah bisa login (tanpa perlu tahu URL Web App/token) dan hanya melihat &amp; mencatat <b>Konseling</b> untuk siswa di kelas yang kamu pilih di sini. Password bisa diisi PIN pendek supaya mudah diingat.</p>
     <form id="konselorAccountForm">
       <div class="form-grid">
         <div class="field"><label>Nama Guru BK</label>
@@ -3228,10 +3536,10 @@ function openKonselorAccounts(){
           </select>
         </div>
         <div class="field full"><label>Kelas Tanggung Jawab</label>
-          <input type="text" id="kaKelas" placeholder="Contoh: VII-A, VII-B (pisahkan dengan koma) — kosongkan untuk akses ke SEMUA kelas" />
+          ${kelasPickerHtml('kaKelasPicker')}
         </div>
       </div>
-      <p class="muted" style="margin:-8px 0 14px">Kosongkan kolom Kelas kalau Guru BK ini boleh mencatat konseling untuk semua kelas, bukan hanya kelas tertentu.</p>
+      <p class="muted" style="margin:-8px 0 14px">Centang satu atau lebih kelas yang menjadi tanggung jawab Guru BK ini. Biarkan &quot;Semua Kelas&quot; kalau Guru BK ini boleh mencatat konseling untuk semua kelas.</p>
       <div class="modal-actions" style="justify-content:flex-start; margin-bottom:18px">
         <button type="submit" class="btn btn-primary" id="kaSubmitBtn"><i class="fa-solid fa-plus"></i> Tambah Akun</button>
         <button type="button" class="btn btn-ghost hidden" id="kaCancelEditBtn">Batal Edit</button>
@@ -3268,6 +3576,7 @@ function openKonselorAccounts(){
       </div>`).join('');
   }
   renderList();
+  const kaPicker = kelasPickerInit('kaKelasPicker');
 
   $('#kaList').addEventListener('click', async (e) => {
     const editBtn = e.target.closest('[data-ka-edit]');
@@ -3281,7 +3590,7 @@ function openKonselorAccounts(){
       $('#kaPassword').value = '';
       $('#kaPassword').placeholder = 'Kosongkan jika tidak ingin mengubah password/PIN';
       $('#kaStatus').value = k.Status || 'Aktif';
-      $('#kaKelas').value = k.Kelas || '';
+      kaPicker.set(k.Kelas || '');
       $('#kaSubmitBtn').innerHTML = '<i class="fa-solid fa-check"></i> Update Akun';
       $('#kaCancelEditBtn').classList.remove('hidden');
       $('#kaNama').focus();
@@ -3303,7 +3612,7 @@ function openKonselorAccounts(){
 
   $('#kaCancelEditBtn').addEventListener('click', () => {
     editingId = null;
-    $('#konselorAccountForm').reset();
+    $('#konselorAccountForm').reset(); kaPicker.reset();
     $('#kaPassword').placeholder = 'Isi/ganti password atau PIN';
     $('#kaSubmitBtn').innerHTML = '<i class="fa-solid fa-plus"></i> Tambah Akun';
     $('#kaCancelEditBtn').classList.add('hidden');
@@ -3315,7 +3624,7 @@ function openKonselorAccounts(){
     const username = $('#kaUsername').value.trim();
     const password = $('#kaPassword').value;
     const status = $('#kaStatus').value;
-    const kelas = $('#kaKelas').value.trim();
+    const kelas = kaPicker.get();
     if (!nama || !username){ toast('Nama dan Username wajib diisi.', 'error'); return; }
     if (!editingId && !password){ toast('Password/PIN wajib diisi untuk akun baru.', 'error'); return; }
     const btn = $('#kaSubmitBtn');
@@ -3335,7 +3644,7 @@ function openKonselorAccounts(){
         toast('Akun Guru BK ditambahkan.', 'success');
       }
       editingId = null;
-      $('#konselorAccountForm').reset();
+      $('#konselorAccountForm').reset(); kaPicker.reset();
       $('#kaPassword').placeholder = 'Isi/ganti password atau PIN';
       $('#kaSubmitBtn').innerHTML = '<i class="fa-solid fa-plus"></i> Tambah Akun';
       $('#kaCancelEditBtn').classList.add('hidden');
